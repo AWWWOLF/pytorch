@@ -847,6 +847,8 @@ class FileSystemReader(StorageReader):
         self,
         path: str | os.PathLike,
         _extension_registry: ExtensionRegistry | None = None,  # EXPERIMENTAL
+        *,
+        mmap: bool = False,
     ) -> None:
         super().__init__()
         self.fs = FileSystem()
@@ -856,12 +858,15 @@ class FileSystemReader(StorageReader):
         self.transforms = _StorageReaderTransforms(_extension_registry)
         self.rank = None
         self.use_collectives = True
+        self.mmap = mmap
+        self._mapped_storages: dict[str, torch.UntypedStorage] = {}
 
     def _slice_file(self, file, sinfo: _StorageInfo) -> IO[bytes]:
         return cast(IO[bytes], _create_file_view(file, sinfo.offset, sinfo.length))
 
     def reset(self, checkpoint_id: str | os.PathLike | None = None) -> None:
         self.storage_data = {}
+        self._mapped_storages.clear()
         if checkpoint_id:
             self.path = self.fs.init_path(checkpoint_id)
         self.load_id = _generate_uuid()
@@ -881,11 +886,12 @@ class FileSystemReader(StorageReader):
                 for req in reqs:
                     item_md = self.storage_data[req.storage_index]
                     file_slice = self._slice_file(stream, item_md)
+                    descriptors = item_md.transform_descriptors or ()
                     transform_from = self.transforms.transform_load_stream(
                         req,
                         # This field wasn't present in older
                         # implementations so provide a fallback.
-                        item_md.transform_descriptors or (),
+                        descriptors,
                         file_slice,
                     )
 
@@ -894,22 +900,57 @@ class FileSystemReader(StorageReader):
                         read_bytes.seek(0)
                         planner.load_bytes(req, read_bytes)
                     else:
-                        if transform_from.seekable():
+                        tensor = None
+                        if self.mmap and type(self.fs) is FileSystem and not descriptors:
+                            physical_path = os.fspath(new_path)
+                            physical_size = os.path.getsize(physical_path)
+                            if (
+                                item_md.offset < 0
+                                or item_md.length <= 0
+                                or item_md.offset + item_md.length > physical_size
+                            ):
+                                raise RuntimeError(
+                                    "DCP storage range is outside the backing file: "
+                                    f"offset={item_md.offset}, length={item_md.length}, "
+                                    f"file_size={physical_size}"
+                                )
+                            overall_storage = self._mapped_storages.get(physical_path)
+                            if overall_storage is None:
+                                overall_storage = torch.UntypedStorage.from_file(
+                                    physical_path, shared=False, nbytes=physical_size
+                                )
+                                self._mapped_storages[physical_path] = overall_storage
+                            try:
+                                tensor = torch.serialization._load_zip_region(
+                                    file_slice,
+                                    overall_storage=overall_storage,
+                                    storage_base_offset=item_md.offset,
+                                    storage_region_length=item_md.length,
+                                    map_location="cpu",
+                                    weights_only=True,
+                                )
+                            except torch.serialization._UnsupportedZipRegion:
+                                file_slice.seek(0)
+
+                        if tensor is None and transform_from.seekable():
                             seekable = transform_from
-                        else:
+                        elif tensor is None:
                             # torch.load requires a seekable input, so read the transform
                             # stream now and store the output if needed
                             seekable = io.BytesIO(transform_from.read(-1))
                             seekable.seek(0)
 
-                        tensor = cast(
-                            Tensor,
-                            torch.load(
-                                seekable,
-                                map_location="cpu",
-                                weights_only=True,
-                            ),
-                        )
+                        if tensor is None:
+                            tensor = cast(
+                                Tensor,
+                                torch.load(
+                                    seekable,
+                                    map_location="cpu",
+                                    weights_only=True,
+                                ),
+                            )
+                        else:
+                            tensor = cast(Tensor, tensor)
                         tensor = narrow_tensor_by_index(
                             tensor, req.storage_offsets, req.lengths
                         )
