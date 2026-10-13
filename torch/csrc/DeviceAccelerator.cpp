@@ -1,3 +1,5 @@
+#include <ATen/Context.h>
+#include <ATen/core/CachingHostAllocator.h>
 #include <c10/core/AllocatorConfig.h>
 #include <torch/csrc/DeviceAccelerator.h>
 #include <torch/csrc/Exceptions.h>
@@ -108,6 +110,35 @@ void initModule(PyObject* module) {
       return;
     }
     at::accelerator::emptyHostCache();
+  });
+
+  m.def(
+      "_accelerator_registerExternalHostMemory", [](uintptr_t ptr, size_t size) {
+        const auto device_type = at::accelerator::getAccelerator(true).value();
+        torch::utils::maybe_initialize_device(device_type);
+        const auto& hooks =
+            at::globalContext().getAcceleratorHooksInterface(device_type);
+        {
+          py::gil_scoped_release no_gil;
+          hooks.registerExternalHostMemory(reinterpret_cast<void*>(ptr), size);
+        }
+        if (auto* host_alloc = at::getHostAllocator(device_type)) {
+          host_alloc->record_external_register(reinterpret_cast<void*>(ptr), size);
+        }
+      });
+
+  m.def("_accelerator_unregisterExternalHostMemory", [](uintptr_t ptr) {
+    const auto device_type = at::accelerator::getAccelerator(true).value();
+    torch::utils::maybe_initialize_device(device_type);
+    const auto& hooks =
+        at::globalContext().getAcceleratorHooksInterface(device_type);
+    {
+      py::gil_scoped_release no_gil;
+      hooks.unregisterExternalHostMemory(reinterpret_cast<void*>(ptr));
+    }
+    if (auto* host_alloc = at::getHostAllocator(device_type)) {
+      host_alloc->record_external_unregister(reinterpret_cast<void*>(ptr));
+    }
   });
 
   m.def("_accelerator_getDeviceStats", [](c10::DeviceIndex device_index) {

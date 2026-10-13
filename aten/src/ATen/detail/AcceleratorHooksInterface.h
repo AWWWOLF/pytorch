@@ -75,6 +75,16 @@ struct TORCH_API AcceleratorHooksInterface {
     return nullptr;
   }
 
+  virtual void registerExternalHostMemory(void* /*ptr*/, size_t /*size*/) const {
+    TORCH_CHECK(
+        false, "Backend doesn't support registerExternalHostMemory()");
+  }
+
+  virtual void unregisterExternalHostMemory(void* /*ptr*/) const {
+    TORCH_CHECK(
+        false, "Backend doesn't support unregisterExternalHostMemory()");
+  }
+
   virtual Device getDeviceFromPtr(void* /*data*/) const {
     TORCH_CHECK(false, "Backend doesn't support getDeviceFromPtr()");
   }

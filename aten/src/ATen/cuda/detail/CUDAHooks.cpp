@@ -260,6 +260,14 @@ Allocator* CUDAHooks::getPinnedMemoryAllocator() const {
   return at::cuda::getPinnedMemoryAllocator();
 }
 
+void CUDAHooks::registerExternalHostMemory(void* ptr, size_t size) const {
+  AT_CUDA_CHECK(cudaHostRegister(ptr, size, cudaHostRegisterPortable));
+}
+
+void CUDAHooks::unregisterExternalHostMemory(void* ptr) const {
+  AT_CUDA_CHECK(cudaHostUnregister(ptr));
+}
+
 Allocator* CUDAHooks::getCUDADeviceAllocator() const {
   return at::cuda::getCUDADeviceAllocator();
 }

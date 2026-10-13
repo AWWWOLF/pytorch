@@ -40,6 +40,8 @@ struct CUDAHooks : public at::CUDAHooksInterface {
   bool hasPrimaryContext(DeviceIndex device_index) const override;
   Allocator* getCUDADeviceAllocator() const override;
   Allocator* getPinnedMemoryAllocator() const override;
+  void registerExternalHostMemory(void* ptr, size_t size) const override;
+  void unregisterExternalHostMemory(void* ptr) const override;
   bool compiledWithCuDNN() const override;
   bool compiledWithMIOpen() const override;
   bool supportsDilatedConvolutionWithCuDNN() const override;

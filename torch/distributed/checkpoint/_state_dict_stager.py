@@ -6,7 +6,6 @@ from copyreg import dispatch_table
 from typing import Any
 
 import torch
-import torch.cuda._pin_memory_utils as pin_memory_utils
 from torch.storage import UntypedStorage
 from torch.utils.weak import WeakIdKeyDictionary
 
@@ -33,10 +32,10 @@ class StateDictStager:
         share_memory: bool = False,
         pin_memory_min_bytes: int = 5,
     ):
-        if pin_memory and not torch.cuda.is_available():
+        if pin_memory and not torch.accelerator.is_available():
             warnings.warn(
                 "Ignoring pin_memory flag for checkpoint staging as pinning memory"
-                "requires CUDA, but CUDA is not available. ",
+                "requires an available accelerator, but no accelerator is available. ",
                 stacklevel=2,
             )
             self.pin_memory = False
@@ -167,10 +166,14 @@ class StateDictStager:
         # Small tensors (e.g., optimizer step counters, scalars) have negligible
         # transfer time improvement from pinning, but pinning overhead is significant
         if self.pin_memory and new_storage.nbytes() >= self.pin_memory_min_bytes:
-            pin_memory_utils.pin_memory(new_storage.data_ptr(), new_storage.nbytes())
+            torch._C._accelerator_registerExternalHostMemory(
+                new_storage.data_ptr(), new_storage.nbytes()
+            )
             # Set up a weak reference to unpin when cpu storage is garbage collected
             f = weakref.finalize(
-                new_storage, pin_memory_utils.unpin_memory, new_storage.data_ptr()
+                new_storage,
+                torch._C._accelerator_unregisterExternalHostMemory,
+                new_storage.data_ptr()
             )
             # This makes sure that the finalizer is not called after
             # cuda context is destroyed.
