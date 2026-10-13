@@ -808,6 +808,137 @@ class _open_zipfile_reader(_opener[torch._C.PyTorchFileReader]):
         super().__init__(torch._C.PyTorchFileReader(name_or_buffer))
 
 
+class _UnsupportedZipRegion(RuntimeError):
+    """Raised when a bounded ZIP cannot safely use mapped storage."""
+
+
+def _validate_zip_region_records(
+    zip_file: torch._C.PyTorchFileReader,
+    zip_view: IO[bytes],
+    region_length: int,
+) -> None:
+    """Validate that tensor records directly address bytes in the ZIP region."""
+
+    get_header_offset = getattr(zip_file, "get_record_header_offset", None)
+    if get_header_offset is None:
+        raise _UnsupportedZipRegion("ZIP reader does not expose local-header offsets")
+
+    data_records = [
+        name for name in zip_file.get_all_records() if name.startswith("data/")
+    ]
+    if not data_records:
+        raise _UnsupportedZipRegion("ZIP region has no tensor storage records")
+
+    original_position = zip_view.tell()
+    try:
+        for record_name in data_records:
+            header_offset = get_header_offset(record_name)
+            record_offset = zip_file.get_record_offset(record_name)
+            if not isinstance(header_offset, int) or header_offset < 0:
+                raise RuntimeError(
+                    f"invalid ZIP local-header offset for {record_name!r}"
+                )
+            if header_offset + 30 > region_length:
+                raise RuntimeError(
+                    f"ZIP local header for {record_name!r} exceeds bounded region"
+                )
+
+            zip_view.seek(header_offset)
+            header = zip_view.read(30)
+            if len(header) != 30:
+                raise RuntimeError(
+                    f"truncated ZIP local header for {record_name!r}"
+                )
+            if header[:4] != b"PK\x03\x04":
+                raise RuntimeError(
+                    "ZIP record and local-header offsets use different coordinates"
+                )
+
+            flags = struct.unpack_from("<H", header, 6)[0]
+            compression = struct.unpack_from("<H", header, 8)[0]
+            if flags & 0x1 or compression != 0:
+                raise _UnsupportedZipRegion(
+                    f"ZIP record {record_name!r} is encrypted or compressed"
+                )
+            filename_length, extra_length = struct.unpack_from("<HH", header, 26)
+            calculated_offset = header_offset + 30 + filename_length + extra_length
+            if calculated_offset != record_offset:
+                raise RuntimeError(
+                    f"inconsistent ZIP record offset for {record_name!r}"
+                )
+            if record_offset < 0 or record_offset >= region_length:
+                raise RuntimeError(
+                    f"ZIP record {record_name!r} exceeds bounded region"
+                )
+    finally:
+        zip_view.seek(original_position)
+
+
+def _load_zip_region(
+    zip_view: IO[bytes],
+    *,
+    overall_storage: torch.UntypedStorage,
+    storage_base_offset: int = 0,
+    storage_region_length: int | None = None,
+    map_location: MAP_LOCATION = "cpu",
+    weights_only: bool = True,
+) -> Any:
+    """Load a bounded ``torch.save`` ZIP from an existing mapped storage.
+
+    ``storage_base_offset`` is the ZIP region's physical offset in
+    ``overall_storage``. The seekable ``zip_view`` must expose the same region
+    starting at logical offset zero.
+    """
+
+    if storage_base_offset < 0:
+        raise ValueError("storage_base_offset must be non-negative")
+    if not zip_view.seekable():
+        raise _UnsupportedZipRegion("ZIP region must be seekable")
+
+    original_position = zip_view.tell()
+    try:
+        zip_view.seek(0, os.SEEK_END)
+        zip_length = zip_view.tell()
+        zip_view.seek(0)
+        if storage_region_length is None:
+            storage_region_length = zip_length
+        if storage_region_length <= 0 or zip_length != storage_region_length:
+            raise ValueError(
+                "storage region length must match the bounded ZIP view length"
+            )
+        if storage_base_offset + storage_region_length > overall_storage.nbytes():
+            raise RuntimeError("bounded ZIP region exceeds mapped storage")
+        if not _is_zipfile(zip_view):
+            raise _UnsupportedZipRegion("bounded region is not a ZIP archive")
+
+        zip_view.seek(0)
+        with _open_zipfile_reader(zip_view) as zip_file:
+            if _is_torchscript_zip(zip_file):
+                raise _UnsupportedZipRegion("TorchScript archives are unsupported")
+            if zip_file.has_record("byteorder"):
+                byteorder = zip_file.get_record("byteorder")
+                if byteorder not in (b"little", b"big"):
+                    raise ValueError(f"unknown checkpoint byte order: {byteorder!r}")
+                if byteorder.decode() != sys.byteorder:
+                    raise _UnsupportedZipRegion(
+                        "cross-endian mapped ZIP regions are unsupported"
+                    )
+            _validate_zip_region_records(zip_file, zip_view, storage_region_length)
+
+            region_storage = overall_storage[
+                storage_base_offset : storage_base_offset + storage_region_length
+            ]
+            return _load(
+                zip_file,
+                map_location=map_location,
+                pickle_module=_weights_only_unpickler if weights_only else pickle,
+                overall_storage=region_storage,
+                weights_only=weights_only,
+            )
+    finally:
+        zip_view.seek(original_position)
+
+
 class _open_zipfile_writer_file(_opener[torch._C.PyTorchFileWriter]):
     def __init__(self, name: str) -> None:
         self.file_stream = None
